@@ -52,6 +52,10 @@ namespace smrobot::spray::rotationbody
             const PublishedTrajectoryPlan& plan,
             const RapidExportSettings& settings,
             const std::vector<RapidSequenceEntry>& sequence);
+        static PlanningResult<RapidModule> generateScheme(
+            const PublishedTrajectoryPlan& plan,
+            const RapidExportSettings& settings,
+            const std::vector<RapidSequenceEntry>& sequence);
         static bool isValidRapidIdentifier(const std::string& value) noexcept;
     };
 }
