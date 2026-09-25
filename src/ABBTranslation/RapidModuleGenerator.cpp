@@ -1,6 +1,7 @@
 #include <CalibrationInstructionTranslation/ABBTranslation/RapidModuleGenerator.h>
 
 #include <RotationBodyTrajectoryPlanning/TrajectoryPlanning/TrajectoryGroupEditor.h>
+#include <RotationBodyTrajectoryPlanning/TrajectoryPlanning/TrajectoryPlanner.h>
 
 #include <Eigen/Geometry>
 
@@ -88,6 +89,14 @@ namespace smrobot::spray::rotationbody
                 : nullptr;
         }
 
+        Eigen::Matrix3d orientationWithoutTilt(
+            const PublishedTrajectoryPlan& plan,
+            const TrajectoryPosePoint& point)
+        {
+            return TrajectoryPlanner::levelSprayAxisAroundLocalY(
+                basePose(plan, point).linear());
+        }
+
         PlanningResult<Eigen::Matrix3d> safetyOrientation(
             const PublishedTrajectoryPlan& plan,
             const std::vector<RapidSequenceEntry>& sequence,
@@ -96,18 +105,20 @@ namespace smrobot::spray::rotationbody
             for(std::size_t index = safetyIndex + 1; index < sequence.size(); ++index) {
                 if(const TrajectoryPass* pass = sequencePass(plan, sequence[index])) {
                     return PlanningResult<Eigen::Matrix3d>::success(
-                        basePose(plan, pass->trajectory.linearPoints.front()).linear());
+                        orientationWithoutTilt(
+                            plan, pass->trajectory.linearPoints.front()));
                 }
             }
             for(std::size_t index = safetyIndex; index-- > 0;) {
                 if(const TrajectoryPass* pass = sequencePass(plan, sequence[index])) {
                     return PlanningResult<Eigen::Matrix3d>::success(
-                        basePose(plan, pass->trajectory.linearPoints.back()).linear());
+                        orientationWithoutTilt(
+                            plan, pass->trajectory.linearPoints.back()));
                 }
             }
             return PlanningResult<Eigen::Matrix3d>::failure(
                 PlanningErrorCode::InvalidArgument,
-                "A safety point requires an adjacent trajectory from which to inherit orientation.");
+                "A safety point requires an adjacent trajectory from which to remove tilt.");
         }
 
         bool coincident(
@@ -161,12 +172,8 @@ namespace smrobot::spray::rotationbody
             sequenceIndex < sequence.size(); ++sequenceIndex) {
             const RapidSequenceEntry& entry = sequence[sequenceIndex];
             if(entry.kind == RapidSequenceEntryKind::SafetyPoint) {
-                PlanningResult<Eigen::Matrix3d> orientation =
+                const PlanningResult<Eigen::Matrix3d> orientation =
                     safetyOrientation(plan, sequence, sequenceIndex);
-                if(previousTrajectoryEnd) {
-                    orientation = PlanningResult<Eigen::Matrix3d>::success(
-                        previousTrajectoryEnd->linear());
-                }
                 if(!orientation) {
                     return PlanningResult<RapidModule>::failure(
                         orientation.error.code,
@@ -214,7 +221,8 @@ namespace smrobot::spray::rotationbody
             }
             declarations << "    VAR speeddata " << speedName << ":=["
                 << number(pass->trajectory.parameters.speedMetersPerSecond * 1000.0)
-                << ",100,5000,1000];\n"
+                << ",100,5000,1000];\n";
+            declarations
                 << robtarget(startName, start, externalAxes)
                 << robtarget(endName, end, externalAxes);
             procedure << "        MoveJ " << startName
@@ -328,6 +336,8 @@ namespace smrobot::spray::rotationbody
             "[9E+09,90.6655,-0.000945636,9E+09,9E+09,9E+09]";
         constexpr const char* passExternalAxes =
             "[9E+09,90.6666,-0.000918239,9E+09,9E+09,9E+09]";
+        std::ostringstream firstSprayProcedure;
+        firstSprayProcedure.imbue(std::locale::classic());
         for(std::size_t pairIndex = 0; pairIndex < passes.size() / 2; ++pairIndex) {
             const IndexedPass& forward = passes[pairIndex * 2];
             const IndexedPass& returning = passes[pairIndex * 2 + 1];
@@ -362,12 +372,16 @@ namespace smrobot::spray::rotationbody
             }
             returnEnd.linear() = end.linear();
 
+            const Eigen::Matrix3d pairSafetyOrientation = orientationWithoutTilt(
+                plan,
+                forward.pass->trajectory.linearPoints.front());
+
             Eigen::Isometry3d safeIn = Eigen::Isometry3d::Identity();
             safeIn.translation() = settings.safetyPositionBaseMeters;
-            safeIn.linear() = start.linear();
+            safeIn.linear() = pairSafetyOrientation;
             Eigen::Isometry3d safeOut = Eigen::Isometry3d::Identity();
             safeOut.translation() = settings.safetyPositionBaseMeters;
-            safeOut.linear() = returnEnd.linear();
+            safeOut.linear() = pairSafetyOrientation;
 
             const std::string suffix = padded2(static_cast<int>(pairIndex + 1));
             const std::string safeInName = "pSafe" + suffix + "In";
@@ -386,18 +400,25 @@ namespace smrobot::spray::rotationbody
                 << robtarget(safeOutName, safeOut, safetyExternalAxes)
                 << '\n';
 
-            if(pairIndex > 0) {
-                sprayProcedure << "        MoveJ " << safeInName
-                    << ",vSafeCustom,fine," << settings.toolDataName << ";\n";
-            }
-            sprayProcedure << "        MoveJ " << startName
-                << ",vSafeCustom,fine," << settings.toolDataName << ";\n"
-                << "        MoveL " << endName << ',' << speedName
+            std::ostringstream pairBody;
+            pairBody << "        MoveL " << endName << ',' << speedName
                 << ",fine," << settings.toolDataName << ";\n"
                 << "        MoveL " << returnName << ',' << speedName
                 << ",fine," << settings.toolDataName << ";\n"
                 << "        MoveJ " << safeOutName
                 << ",vSafeCustom,fine," << settings.toolDataName << ";\n\n";
+            if(pairIndex > 0) {
+                sprayProcedure << "        MoveJ " << safeInName
+                    << ",vSafeCustom,fine," << settings.toolDataName << ";\n";
+                firstSprayProcedure << "        MoveJ " << safeInName
+                    << ",vSafeCustom,fine," << settings.toolDataName << ";\n";
+            }
+            sprayProcedure << "        MoveJ " << startName
+                << ",vSafeCustom,fine," << settings.toolDataName << ";\n"
+                << pairBody.str();
+            firstSprayProcedure << "        MoveJ " << startName
+                << ",vSafeCustom,fine," << settings.toolDataName << ";\n"
+                << pairBody.str();
         }
 
         std::ostringstream mainProcedure;
@@ -407,9 +428,12 @@ namespace smrobot::spray::rotationbody
             << "        MoveJ pSafe01In,vSafeCustom,fine,"
             << settings.toolDataName << ";\n\n"
             << "        StartTable;\n\n"
-            << "        FOR i FROM 1 TO nSprayTimes DO\n"
-            << "            SprayOnce;\n"
-            << "        ENDFOR\n\n"
+            << "        IF nSprayTimes > 0 THEN\n"
+            << "            SprayFirst;\n"
+            << "            FOR i FROM 2 TO nSprayTimes DO\n"
+            << "                SprayOnce;\n"
+            << "            ENDFOR\n"
+            << "        ENDIF\n\n"
             << "        StopTable;\n"
             << "    ENDPROC\n\n"
             << "    PROC StartTable()\n"
@@ -417,6 +441,9 @@ namespace smrobot::spray::rotationbody
             << "        IndReset STN1,1\\RefNum:=0\\Short;\n"
             << "        IndCMove STN1,1,nTableRPM * 6;\n"
             << "        WaitTime 3;\n"
+            << "    ENDPROC\n\n"
+            << "    PROC SprayFirst()\n\n"
+            << firstSprayProcedure.str()
             << "    ENDPROC\n\n"
             << "    PROC SprayOnce()\n\n"
             << sprayProcedure.str()
