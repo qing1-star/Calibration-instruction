@@ -6,6 +6,8 @@
 #include <Eigen/Geometry>
 #include <Eigen/StdVector>
 
+#include <array>
+#include <string>
 #include <vector>
 
 namespace smrobot::spray::rotationbody
@@ -55,6 +57,24 @@ namespace smrobot::spray::rotationbody
         double fittedRadiusMeters{ 0.0 };
         double yDirectionDistanceMeters{ 0.0 };
         bool shortYDirectionBaseline{ false };
+    };
+
+    struct ModeTwoCalibrationInput
+    {
+        EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+        std::array<Eigen::Vector3d, 6> circlePointsBaseMeters{};
+        Eigen::Vector3d topReferenceBaseMeters = Eigen::Vector3d::Zero();
+        Eigen::Vector3d yDirectionStartBaseMeters = Eigen::Vector3d::Zero();
+        Eigen::Vector3d yDirectionEndBaseMeters = Eigen::Vector3d::Zero();
+        Eigen::Vector3d safetyPositionBaseMeters = Eigen::Vector3d::Zero();
+    };
+
+    class CalibrationTextParser final
+    {
+    public:
+        static PlanningResult<ModeTwoCalibrationInput> parseModeTwo(
+            const std::string& text);
     };
 
     class WorkpieceCalibrationSolver final

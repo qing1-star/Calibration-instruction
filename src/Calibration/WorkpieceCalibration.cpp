@@ -7,8 +7,11 @@
 #include <Eigen/Geometry>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
+#include <locale>
 #include <limits>
+#include <sstream>
 
 namespace smrobot::spray::rotationbody
 {
@@ -230,6 +233,103 @@ namespace smrobot::spray::rotationbody
             }
             return current;
         }
+
+        std::string trim(const std::string& value)
+        {
+            const auto first = std::find_if_not(
+                value.begin(), value.end(), [](unsigned char character) {
+                    return std::isspace(character) != 0;
+                });
+            const auto last = std::find_if_not(
+                value.rbegin(), value.rend(), [](unsigned char character) {
+                    return std::isspace(character) != 0;
+                }).base();
+            return first < last ? std::string(first, last) : std::string();
+        }
+
+        bool parseCoordinate(const std::string& text, double& value)
+        {
+            std::istringstream stream(text);
+            stream.imbue(std::locale::classic());
+            stream >> value;
+            stream >> std::ws;
+            return stream.eof() && std::isfinite(value);
+        }
+
+        PlanningResult<Eigen::Vector3d> parsePointLine(
+            const std::string& line,
+            std::size_t sourceLine)
+        {
+            std::array<double, 3> coordinates{};
+            std::size_t begin = 0;
+            for(std::size_t index = 0; index < coordinates.size(); ++index) {
+                const std::size_t separator = line.find('/', begin);
+                const bool finalCoordinate = index + 1 == coordinates.size();
+                if((finalCoordinate && separator != std::string::npos) ||
+                    (!finalCoordinate && separator == std::string::npos)) {
+                    return PlanningResult<Eigen::Vector3d>::failure(
+                        PlanningErrorCode::InvalidArgument,
+                        "Calibration TXT line " + std::to_string(sourceLine) +
+                            " must contain exactly three '/'-separated coordinates.");
+                }
+                const std::size_t end = finalCoordinate ? line.size() : separator;
+                if(!parseCoordinate(trim(line.substr(begin, end - begin)), coordinates[index])) {
+                    return PlanningResult<Eigen::Vector3d>::failure(
+                        PlanningErrorCode::InvalidArgument,
+                        "Calibration TXT line " + std::to_string(sourceLine) +
+                            " contains an invalid coordinate.");
+                }
+                begin = end + 1;
+            }
+            return PlanningResult<Eigen::Vector3d>::success(
+                Eigen::Vector3d(coordinates[0], coordinates[1], coordinates[2]) /
+                    1000.0);
+        }
+    }
+
+    PlanningResult<ModeTwoCalibrationInput> CalibrationTextParser::parseModeTwo(
+        const std::string& text)
+    {
+        std::array<Eigen::Vector3d, 10> points{};
+        std::size_t pointCount = 0;
+        std::size_t sourceLine = 0;
+        std::istringstream input(text);
+        std::string line;
+        while(std::getline(input, line)) {
+            ++sourceLine;
+            if(sourceLine == 1 && line.compare(0, 3, "\xEF\xBB\xBF") == 0) {
+                line.erase(0, 3);
+            }
+            line = trim(line);
+            if(line.empty()) continue;
+            if(pointCount >= points.size()) {
+                return PlanningResult<ModeTwoCalibrationInput>::failure(
+                    PlanningErrorCode::InvalidArgument,
+                    "Mode 2 calibration TXT must contain exactly 10 non-empty point lines.");
+            }
+            PlanningResult<Eigen::Vector3d> point = parsePointLine(line, sourceLine);
+            if(!point) {
+                return PlanningResult<ModeTwoCalibrationInput>::failure(
+                    point.error.code,
+                    point.error.message);
+            }
+            points[pointCount++] = point.value;
+        }
+        if(pointCount != points.size()) {
+            return PlanningResult<ModeTwoCalibrationInput>::failure(
+                PlanningErrorCode::InvalidArgument,
+                "Mode 2 calibration TXT must contain exactly 10 non-empty point lines; found " +
+                    std::to_string(pointCount) + ".");
+        }
+
+        ModeTwoCalibrationInput result;
+        std::copy_n(points.begin(), result.circlePointsBaseMeters.size(),
+            result.circlePointsBaseMeters.begin());
+        result.topReferenceBaseMeters = points[6];
+        result.yDirectionStartBaseMeters = points[7];
+        result.yDirectionEndBaseMeters = points[8];
+        result.safetyPositionBaseMeters = points[9];
+        return PlanningResult<ModeTwoCalibrationInput>::success(std::move(result));
     }
 
     PlanningResult<CalibrationAxisFit> WorkpieceCalibrationSolver::fitCylinder3d(

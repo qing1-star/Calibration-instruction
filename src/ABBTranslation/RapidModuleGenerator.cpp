@@ -1,6 +1,7 @@
 #include <CalibrationInstructionTranslation/ABBTranslation/RapidModuleGenerator.h>
 
 #include <RotationBodyTrajectoryPlanning/TrajectoryPlanning/TrajectoryGroupEditor.h>
+#include <RotationBodyTrajectoryPlanning/TrajectoryPlanning/TrajectoryPlanner.h>
 
 #include <Eigen/Geometry>
 
@@ -41,14 +42,10 @@ namespace smrobot::spray::rotationbody
             return stream.str();
         }
 
-        std::string fixed3(double value)
+        std::string padded3(int value)
         {
-            if(std::abs(value) < 5.0e-10) {
-                value = 0.0;
-            }
             std::ostringstream stream;
-            stream.imbue(std::locale::classic());
-            stream << std::fixed << std::setprecision(3) << value;
+            stream << std::setw(3) << std::setfill('0') << value;
             return stream.str();
         }
 
@@ -92,6 +89,14 @@ namespace smrobot::spray::rotationbody
                 : nullptr;
         }
 
+        Eigen::Matrix3d orientationWithoutTilt(
+            const PublishedTrajectoryPlan& plan,
+            const TrajectoryPosePoint& point)
+        {
+            return TrajectoryPlanner::levelSprayAxisAroundLocalY(
+                basePose(plan, point).linear());
+        }
+
         PlanningResult<Eigen::Matrix3d> safetyOrientation(
             const PublishedTrajectoryPlan& plan,
             const std::vector<RapidSequenceEntry>& sequence,
@@ -100,18 +105,20 @@ namespace smrobot::spray::rotationbody
             for(std::size_t index = safetyIndex + 1; index < sequence.size(); ++index) {
                 if(const TrajectoryPass* pass = sequencePass(plan, sequence[index])) {
                     return PlanningResult<Eigen::Matrix3d>::success(
-                        basePose(plan, pass->trajectory.linearPoints.front()).linear());
+                        orientationWithoutTilt(
+                            plan, pass->trajectory.linearPoints.front()));
                 }
             }
             for(std::size_t index = safetyIndex; index-- > 0;) {
                 if(const TrajectoryPass* pass = sequencePass(plan, sequence[index])) {
                     return PlanningResult<Eigen::Matrix3d>::success(
-                        basePose(plan, pass->trajectory.linearPoints.back()).linear());
+                        orientationWithoutTilt(
+                            plan, pass->trajectory.linearPoints.back()));
                 }
             }
             return PlanningResult<Eigen::Matrix3d>::failure(
                 PlanningErrorCode::InvalidArgument,
-                "A safety point requires an adjacent trajectory from which to inherit orientation.");
+                "A safety point requires an adjacent trajectory from which to remove tilt.");
         }
 
         bool coincident(
@@ -144,91 +151,43 @@ namespace smrobot::spray::rotationbody
                 groupValidation.error.message);
         }
 
-        std::ostringstream speedDeclarations;
-        std::ostringstream controlDeclarations;
-        std::ostringstream targetDeclarations;
-        std::ostringstream mainProcedure;
-        std::ostringstream sprayProcedure;
+        std::ostringstream declarations;
+        std::ostringstream procedure;
+        declarations.imbue(std::locale::classic());
+        procedure.imbue(std::locale::classic());
         RapidPreviewSteps previewSteps;
-        speedDeclarations.imbue(std::locale::classic());
-        controlDeclarations.imbue(std::locale::classic());
-        targetDeclarations.imbue(std::locale::classic());
-        mainProcedure.imbue(std::locale::classic());
-        sprayProcedure.imbue(std::locale::classic());
-
-        const TrajectoryPass* firstPass = nullptr;
-        for(const RapidSequenceEntry& entry : sequence) {
-            if(entry.kind != RapidSequenceEntryKind::Trajectory) continue;
-            firstPass = sequencePass(plan, entry);
-            if(firstPass != nullptr) break;
-        }
-        if(firstPass == nullptr || !firstPass->trajectory.hasValidPoints() ||
-            !std::isfinite(firstPass->trajectory.parameters.positionerRpm)) {
-            return PlanningResult<RapidModule>::failure(
-                PlanningErrorCode::InvalidArgument,
-                "The ABB instruction sequence must contain a trajectory with a finite positioner RPM.");
-        }
-
-        speedDeclarations << "    VAR speeddata vSafeCustom:=["
+        declarations << "    VAR speeddata vSafeCustom:=["
             << number(settings.safetySpeedMetersPerSecond * 1000.0)
             << ",100,5000,1000];\n";
-        controlDeclarations << "    PERS num nTableRPM:="
-            << number(firstPass->trajectory.parameters.positionerRpm)
-            << ";\n"
-            << "    PERS num nSprayTimes:=15;\n"
-            << "    VAR num i;\n";
-        mainProcedure << "    PROC main()\n"
+        procedure << "    PROC main()\n"
             << "        ConfJ \\Off;\n"
-            << "        ConfL \\Off;\n"
-            << "\n        StartTable;\n"
-            << "\n        FOR i FROM 1 TO nSprayTimes DO\n"
-            << "            SprayOnce;\n"
-            << "        ENDFOR\n"
-            << "\n        StopTable;\n"
-            << "    ENDPROC\n\n"
-            << "    PROC StartTable()\n"
-            << "        ActUnit STN1;\n"
-            << "        IndReset STN1,1\\RefNum:=0\\Short;\n"
-            << "        IndCMove STN1,1,nTableRPM * 6;\n"
-            << "        WaitTime 3;\n"
-            << "    ENDPROC\n\n";
+            << "        ConfL \\Off;\n";
 
-        constexpr const char* safetyExternalAxes =
-            "[9E+09,90.6655,-0.000945636,9E+09,9E+09,9E+09]";
-        constexpr const char* passExternalAxes =
-            "[9E+09,90.6666,-0.000918239,9E+09,9E+09,9E+09]";
-
+        constexpr const char* externalAxes =
+            "[9E9,9E9,9E9,9E9,9E9,9E9]";
         int safetyNumber = 0;
         int trajectoryNumber = 0;
         std::optional<Eigen::Isometry3d> previousTrajectoryEnd;
         for(std::size_t sequenceIndex = 0;
-            sequenceIndex < sequence.size();
-            ++sequenceIndex) {
+            sequenceIndex < sequence.size(); ++sequenceIndex) {
             const RapidSequenceEntry& entry = sequence[sequenceIndex];
             if(entry.kind == RapidSequenceEntryKind::SafetyPoint) {
-                PlanningResult<Eigen::Matrix3d> orientation =
+                const PlanningResult<Eigen::Matrix3d> orientation =
                     safetyOrientation(plan, sequence, sequenceIndex);
-                // Once the sequence has started, keep safety moves continuous
-                // with the final pose already sent to the robot.  The first
-                // safety point still inherits from its following trajectory.
-                if(previousTrajectoryEnd) {
-                    orientation = PlanningResult<Eigen::Matrix3d>::success(
-                        previousTrajectoryEnd->linear());
-                }
                 if(!orientation) {
                     return PlanningResult<RapidModule>::failure(
                         orientation.error.code,
                         orientation.error.message);
                 }
                 ++safetyNumber;
-                const std::string name = "pSafe" + padded2(safetyNumber);
+                const std::string name = "pSafe" + padded3(safetyNumber);
                 Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
                 pose.translation() = settings.safetyPositionBaseMeters;
                 pose.linear() = orientation.value;
-                targetDeclarations << robtarget(name, pose, safetyExternalAxes);
-                sprayProcedure << "        MoveJ " << name
+                declarations << robtarget(name, pose, externalAxes);
+                procedure << "        MoveJ " << name
                     << ",vSafeCustom,fine," << settings.toolDataName
-                    << ";\n";
+                    << "\\WObj:=wobj0;\n";
                 RapidPreviewStep preview;
                 preview.sourceKind = RapidSequenceEntryKind::SafetyPoint;
                 preview.instruction = "MoveJ";
@@ -246,51 +205,32 @@ namespace smrobot::spray::rotationbody
                     PlanningErrorCode::InvalidArgument,
                     "The ABB instruction sequence references a missing trajectory.");
             }
-            if(!std::isfinite(pass->trajectory.parameters.positionerRpm) ||
-                std::abs(pass->trajectory.parameters.positionerRpm -
-                    firstPass->trajectory.parameters.positionerRpm) > 1.0e-9) {
-                return PlanningResult<RapidModule>::failure(
-                    PlanningErrorCode::InvalidArgument,
-                    "All trajectories in one ABB export must use the same finite positioner RPM.");
-            }
             ++trajectoryNumber;
-            const std::string suffix = padded2(trajectoryNumber);
-            const std::string startName = "pPass" + suffix + "Start";
-            const std::string endName = "pPass" + suffix + "End";
+            const std::string suffix = padded3(trajectoryNumber);
+            const std::string startName = "pTraj" + suffix + "Start";
+            const std::string endName = "pTraj" + suffix + "End";
             const std::string speedName = "vSpray" + suffix;
             Eigen::Isometry3d start =
                 basePose(plan, pass->trajectory.linearPoints.front());
             Eigen::Isometry3d end =
                 basePose(plan, pass->trajectory.linearPoints.back());
-
-            // A reversed pass is commonly used to return over the same spray
-            // line.  When its start position is the previous pass' end,
-            // preserve the complete tool orientation for the whole pass.
-            // This avoids an unnecessary 180-degree wrist rotation while the
-            // robot travels back along the already coincident line.
             if(previousTrajectoryEnd && coincident(
                 previousTrajectoryEnd->translation(), start.translation())) {
                 start.linear() = previousTrajectoryEnd->linear();
                 end.linear() = previousTrajectoryEnd->linear();
             }
-            speedDeclarations << "    VAR speeddata " << speedName << ":=["
+            declarations << "    VAR speeddata " << speedName << ":=["
                 << number(pass->trajectory.parameters.speedMetersPerSecond * 1000.0)
                 << ",100,5000,1000];\n";
-            targetDeclarations << robtarget(startName, start, passExternalAxes);
-            targetDeclarations << robtarget(endName, end, passExternalAxes);
-            sprayProcedure << "\n        ! Pass" << trajectoryNumber
-                << ", tilt="
-                << fixed3(pass->trajectory.parameters.tiltRadians *
-                    180.0 / std::acos(-1.0))
-                << " deg, D="
-                << fixed3(pass->trajectory.parameters.sprayDistanceMeters * 1000.0)
-                << " mm\n";
-            sprayProcedure << "        MoveJ " << startName
+            declarations
+                << robtarget(startName, start, externalAxes)
+                << robtarget(endName, end, externalAxes);
+            procedure << "        MoveJ " << startName
                 << ",vSafeCustom,fine," << settings.toolDataName
-                << ";\n";
-            sprayProcedure << "        MoveL " << endName << ',' << speedName
+                << "\\WObj:=wobj0;\n"
+                << "        MoveL " << endName << ',' << speedName
                 << ",fine," << settings.toolDataName
-                << ";\n";
+                << "\\WObj:=wobj0;\n";
 
             RapidPreviewStep startPreview;
             startPreview.sourceKind = RapidSequenceEntryKind::Trajectory;
@@ -300,7 +240,6 @@ namespace smrobot::spray::rotationbody
             startPreview.sequenceIndex = sequenceIndex;
             startPreview.baseFromTool = start;
             previewSteps.push_back(std::move(startPreview));
-
             RapidPreviewStep endPreview;
             endPreview.sourceKind = RapidSequenceEntryKind::Trajectory;
             endPreview.instruction = "MoveL";
@@ -311,7 +250,202 @@ namespace smrobot::spray::rotationbody
             previewSteps.push_back(std::move(endPreview));
             previousTrajectoryEnd = end;
         }
-        mainProcedure << "    PROC SprayOnce()\n"
+        procedure << "    ENDPROC\n";
+
+        RapidModule module;
+        std::ostringstream output;
+        output << "MODULE " << settings.moduleName << "\n"
+            << "    ! Generated by RS2026 rotation-body trajectory planning.\n"
+            << "    ! Workpiece-local poses are converted with T_base_planning.\n"
+            << "    ! Verify reachability, collisions, TCP and robot configuration in RobotStudio.\n\n"
+            << declarations.str() << '\n'
+            << procedure.str()
+            << "ENDMODULE\n";
+        module.code = output.str();
+        module.previewSteps = std::move(previewSteps);
+        return PlanningResult<RapidModule>::success(std::move(module));
+    }
+
+    PlanningResult<RapidModule> RapidModuleGenerator::generateScheme(
+        const PublishedTrajectoryPlan& plan,
+        const RapidExportSettings& settings,
+        const std::vector<RapidSequenceEntry>& sequence)
+    {
+        if(plan.objectId.empty() || !plan.baseFromPlanning.matrix().allFinite() ||
+            !settings.safetyPositionBaseMeters.allFinite() ||
+            !std::isfinite(settings.safetySpeedMetersPerSecond) ||
+            settings.safetySpeedMetersPerSecond <= 0.0 ||
+            !isValidRapidIdentifier(settings.moduleName) ||
+            !isValidRapidIdentifier(settings.toolDataName) || sequence.empty()) {
+            return PlanningResult<RapidModule>::failure(
+                PlanningErrorCode::InvalidArgument,
+                "ABB RAPID settings, workpiece base pose, or instruction sequence is invalid.");
+        }
+        PlanningResult<void> groupValidation = TrajectoryGroupEditor::validate(plan.group);
+        if(!groupValidation) {
+            return PlanningResult<RapidModule>::failure(
+                groupValidation.error.code,
+                groupValidation.error.message);
+        }
+
+        struct IndexedPass
+        {
+            const TrajectoryPass* pass{ nullptr };
+        };
+        std::vector<IndexedPass> passes;
+        for(std::size_t index = 0; index < sequence.size(); ++index) {
+            if(sequence[index].kind != RapidSequenceEntryKind::Trajectory) continue;
+            const TrajectoryPass* pass = sequencePass(plan, sequence[index]);
+            if(pass == nullptr || !pass->trajectory.hasValidPoints()) {
+                return PlanningResult<RapidModule>::failure(
+                    PlanningErrorCode::InvalidArgument,
+                    "The ABB instruction sequence references a missing trajectory.");
+            }
+            passes.push_back({ pass });
+        }
+        if(passes.size() < 2 || passes.size() % 2 != 0) {
+            return PlanningResult<RapidModule>::failure(
+                PlanningErrorCode::InvalidArgument,
+                "SprayScheme requires an even number of trajectories arranged as forward/return pairs.");
+        }
+        const double positionerRpm =
+            passes.front().pass->trajectory.parameters.positionerRpm;
+        if(!std::isfinite(positionerRpm)) {
+            return PlanningResult<RapidModule>::failure(
+                PlanningErrorCode::InvalidArgument,
+                "SprayScheme requires a finite positioner RPM.");
+        }
+
+        std::ostringstream speedDeclarations;
+        std::ostringstream controlDeclarations;
+        std::ostringstream targetDeclarations;
+        std::ostringstream sprayProcedure;
+        speedDeclarations.imbue(std::locale::classic());
+        controlDeclarations.imbue(std::locale::classic());
+        targetDeclarations.imbue(std::locale::classic());
+        sprayProcedure.imbue(std::locale::classic());
+        speedDeclarations << "    VAR speeddata vSafeCustom:=["
+            << number(settings.safetySpeedMetersPerSecond * 1000.0)
+            << ",100,5000,1000];\n";
+        controlDeclarations << "    PERS num nTableRPM:="
+            << number(positionerRpm) << ";\n"
+            << "    PERS num nSprayTimes:=15;\n"
+            << "    VAR num i;\n";
+
+        constexpr const char* safetyExternalAxes =
+            "[9E+09,90.6655,-0.000945636,9E+09,9E+09,9E+09]";
+        constexpr const char* passExternalAxes =
+            "[9E+09,90.6666,-0.000918239,9E+09,9E+09,9E+09]";
+        std::ostringstream firstSprayProcedure;
+        firstSprayProcedure.imbue(std::locale::classic());
+        for(std::size_t pairIndex = 0; pairIndex < passes.size() / 2; ++pairIndex) {
+            const IndexedPass& forward = passes[pairIndex * 2];
+            const IndexedPass& returning = passes[pairIndex * 2 + 1];
+            if(!std::isfinite(forward.pass->trajectory.parameters.positionerRpm) ||
+                !std::isfinite(returning.pass->trajectory.parameters.positionerRpm) ||
+                std::abs(forward.pass->trajectory.parameters.positionerRpm - positionerRpm) > 1.0e-9 ||
+                std::abs(returning.pass->trajectory.parameters.positionerRpm - positionerRpm) > 1.0e-9) {
+                return PlanningResult<RapidModule>::failure(
+                    PlanningErrorCode::InvalidArgument,
+                    "All trajectories in one SprayScheme export must use the same positioner RPM.");
+            }
+            if(std::abs(forward.pass->trajectory.parameters.speedMetersPerSecond -
+                returning.pass->trajectory.parameters.speedMetersPerSecond) > 1.0e-9) {
+                return PlanningResult<RapidModule>::failure(
+                    PlanningErrorCode::InvalidArgument,
+                    "Each SprayScheme forward/return pair must use the same spray speed.");
+            }
+
+            Eigen::Isometry3d start = basePose(
+                plan, forward.pass->trajectory.linearPoints.front());
+            Eigen::Isometry3d end = basePose(
+                plan, forward.pass->trajectory.linearPoints.back());
+            Eigen::Isometry3d returnStart = basePose(
+                plan, returning.pass->trajectory.linearPoints.front());
+            Eigen::Isometry3d returnEnd = basePose(
+                plan, returning.pass->trajectory.linearPoints.back());
+            if(!coincident(end.translation(), returnStart.translation()) ||
+                !coincident(start.translation(), returnEnd.translation())) {
+                return PlanningResult<RapidModule>::failure(
+                    PlanningErrorCode::InvalidArgument,
+                    "Each SprayScheme trajectory pair must return over the same line in reverse.");
+            }
+            returnEnd.linear() = end.linear();
+
+            const Eigen::Matrix3d pairSafetyOrientation = orientationWithoutTilt(
+                plan,
+                forward.pass->trajectory.linearPoints.front());
+
+            Eigen::Isometry3d safeIn = Eigen::Isometry3d::Identity();
+            safeIn.translation() = settings.safetyPositionBaseMeters;
+            safeIn.linear() = pairSafetyOrientation;
+            Eigen::Isometry3d safeOut = Eigen::Isometry3d::Identity();
+            safeOut.translation() = settings.safetyPositionBaseMeters;
+            safeOut.linear() = pairSafetyOrientation;
+
+            const std::string suffix = padded2(static_cast<int>(pairIndex + 1));
+            const std::string safeInName = "pSafe" + suffix + "In";
+            const std::string startName = "pPass" + suffix + "Start";
+            const std::string endName = "pPass" + suffix + "End";
+            const std::string returnName = "pPass" + suffix + "Return";
+            const std::string safeOutName = "pSafe" + suffix + "Out";
+            const std::string speedName = "vSpray" + suffix;
+            speedDeclarations << "    VAR speeddata " << speedName << ":=["
+                << number(forward.pass->trajectory.parameters.speedMetersPerSecond * 1000.0)
+                << ",100,5000,1000];\n";
+            targetDeclarations << robtarget(safeInName, safeIn, safetyExternalAxes)
+                << robtarget(startName, start, passExternalAxes)
+                << robtarget(endName, end, passExternalAxes)
+                << robtarget(returnName, returnEnd, passExternalAxes)
+                << robtarget(safeOutName, safeOut, safetyExternalAxes)
+                << '\n';
+
+            std::ostringstream pairBody;
+            pairBody << "        MoveL " << endName << ',' << speedName
+                << ",fine," << settings.toolDataName << ";\n"
+                << "        MoveL " << returnName << ',' << speedName
+                << ",fine," << settings.toolDataName << ";\n"
+                << "        MoveJ " << safeOutName
+                << ",vSafeCustom,fine," << settings.toolDataName << ";\n\n";
+            if(pairIndex > 0) {
+                sprayProcedure << "        MoveJ " << safeInName
+                    << ",vSafeCustom,fine," << settings.toolDataName << ";\n";
+                firstSprayProcedure << "        MoveJ " << safeInName
+                    << ",vSafeCustom,fine," << settings.toolDataName << ";\n";
+            }
+            sprayProcedure << "        MoveJ " << startName
+                << ",vSafeCustom,fine," << settings.toolDataName << ";\n"
+                << pairBody.str();
+            firstSprayProcedure << "        MoveJ " << startName
+                << ",vSafeCustom,fine," << settings.toolDataName << ";\n"
+                << pairBody.str();
+        }
+
+        std::ostringstream mainProcedure;
+        mainProcedure << "    PROC main()\n"
+            << "        ConfJ \\Off;\n"
+            << "        ConfL \\Off;\n\n"
+            << "        MoveJ pSafe01In,vSafeCustom,fine,"
+            << settings.toolDataName << ";\n\n"
+            << "        StartTable;\n\n"
+            << "        IF nSprayTimes > 0 THEN\n"
+            << "            SprayFirst;\n"
+            << "            FOR i FROM 2 TO nSprayTimes DO\n"
+            << "                SprayOnce;\n"
+            << "            ENDFOR\n"
+            << "        ENDIF\n\n"
+            << "        StopTable;\n"
+            << "    ENDPROC\n\n"
+            << "    PROC StartTable()\n"
+            << "        ActUnit STN1;\n"
+            << "        IndReset STN1,1\\RefNum:=0\\Short;\n"
+            << "        IndCMove STN1,1,nTableRPM * 6;\n"
+            << "        WaitTime 3;\n"
+            << "    ENDPROC\n\n"
+            << "    PROC SprayFirst()\n\n"
+            << firstSprayProcedure.str()
+            << "    ENDPROC\n\n"
+            << "    PROC SprayOnce()\n\n"
             << sprayProcedure.str()
             << "    ENDPROC\n\n"
             << "    PROC StopTable()\n"
@@ -321,7 +455,7 @@ namespace smrobot::spray::rotationbody
 
         RapidModule module;
         std::ostringstream output;
-        output << "MODULE " << settings.moduleName << "\n"
+        output << "MODULE SprayScheme\n"
             << "    ! Generated by RS2026 rotation-body trajectory planning.\n"
             << "    ! Workpiece-local poses are converted with T_base_planning.\n"
             << "    ! nTableRPM is copied from trajectory planning and remains operator-editable.\n"
@@ -333,7 +467,6 @@ namespace smrobot::spray::rotationbody
             << mainProcedure.str()
             << "ENDMODULE\n";
         module.code = output.str();
-        module.previewSteps = std::move(previewSteps);
         return PlanningResult<RapidModule>::success(std::move(module));
     }
 
